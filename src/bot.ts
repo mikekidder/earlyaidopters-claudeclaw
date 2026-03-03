@@ -78,6 +78,17 @@ import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './wh
 // Per-chat voice mode toggle (in-memory, resets on restart)
 const voiceEnabledChats = new Set<string>();
 
+// Per-chat model override (in-memory, resets on restart)
+// When not set, uses CLI default (Opus via Max/OAuth)
+const chatModelOverride = new Map<string, string>();
+
+const AVAILABLE_MODELS: Record<string, string> = {
+  opus: 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-5',
+  haiku: 'claude-haiku-4-5',
+};
+const DEFAULT_MODEL_LABEL = 'opus';
+
 // WhatsApp state per Telegram chat
 interface WaStateList { mode: 'list'; chats: WaChat[] }
 interface WaStateChat { mode: 'chat'; chatId: string; chatName: string }
@@ -337,7 +348,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       sessionId,
       () => void sendTyping(ctx.api, chatId),
       onProgress,
-      undefined,
+      chatModelOverride.get(chatIdStr),
       abortCtrl,
     );
 
@@ -465,6 +476,41 @@ export function createBot(): Bot {
 
   const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
+  // Register commands in the Telegram menu
+  bot.api.setMyCommands([
+    { command: 'start', description: 'Start the bot' },
+    { command: 'help', description: 'Help — list available commands' },
+    { command: 'newchat', description: 'Start a new Claude session' },
+    { command: 'respin', description: 'Reload recent context' },
+    { command: 'voice', description: 'Toggle voice mode on/off' },
+    { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
+    { command: 'memory', description: 'View recent memories' },
+    { command: 'forget', description: 'Clear session' },
+    { command: 'wa', description: 'Recent WhatsApp messages' },
+    { command: 'slack', description: 'Recent Slack messages' },
+    { command: 'dashboard', description: 'Open web dashboard' },
+    { command: 'stop', description: 'Stop current processing' },
+  ]).catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
+
+  // /help — list available commands
+  bot.command('help', (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    return ctx.reply(
+      'ClaudeClaw — Commands\n\n' +
+      '/newchat — Start a new Claude session\n' +
+      '/respin — Reload recent context\n' +
+      '/voice — Toggle voice mode on/off\n' +
+      '/model — Switch model (opus/sonnet/haiku)\n' +
+      '/memory — View recent memories\n' +
+      '/forget — Clear session\n' +
+      '/wa — WhatsApp messages\n' +
+      '/slack — Slack messages\n' +
+      '/dashboard — Web dashboard\n' +
+      '/stop — Stop current processing\n\n' +
+      'You can also send voice notes, photos, files, and videos.'
+    );
+  });
+
   // /chatid — get the chat ID (used during first-time setup)
   // Responds to anyone only when ALLOWED_CHAT_ID is not yet configured.
   bot.command('chatid', (ctx) => {
@@ -534,6 +580,38 @@ export function createBot(): Bot {
       voiceEnabledChats.add(chatIdStr);
       await ctx.reply('Voice mode ON');
     }
+  });
+
+  // /model — switch Claude model (opus, sonnet, haiku)
+  bot.command('model', async (ctx) => {
+    if (!isAuthorised(ctx.chat!.id)) return;
+    const chatIdStr = ctx.chat!.id.toString();
+    const arg = ctx.match?.trim().toLowerCase();
+
+    if (!arg) {
+      const current = chatModelOverride.get(chatIdStr);
+      const currentLabel = current
+        ? Object.entries(AVAILABLE_MODELS).find(([, v]) => v === current)?.[0] ?? current
+        : DEFAULT_MODEL_LABEL + ' (default)';
+      const models = Object.keys(AVAILABLE_MODELS).join(', ');
+      await ctx.reply(`Current model: ${currentLabel}\nAvailable: ${models}\n\nUsage: /model haiku`);
+      return;
+    }
+
+    if (arg === 'reset' || arg === 'default' || arg === 'opus') {
+      chatModelOverride.delete(chatIdStr);
+      await ctx.reply('Model reset to default (opus)');
+      return;
+    }
+
+    const modelId = AVAILABLE_MODELS[arg];
+    if (!modelId) {
+      await ctx.reply(`Unknown model: ${arg}\nAvailable: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
+      return;
+    }
+
+    chatModelOverride.set(chatIdStr, modelId);
+    await ctx.reply(`Model changed: ${arg} (${modelId})`);
   });
 
   // /memory — show recent memories for this chat
@@ -651,7 +729,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/newchat', '/respin', '/voice', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/chatid', '/wa', '/slack', '/dashboard', '/stop']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
