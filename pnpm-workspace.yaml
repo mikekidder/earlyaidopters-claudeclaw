@@ -1,0 +1,7 @@
+ignoredBuiltDependencies:
+  - esbuild
+  - protobufjs
+  - puppeteer
+
+onlyBuiltDependencies:
+  - better-sqlite3
