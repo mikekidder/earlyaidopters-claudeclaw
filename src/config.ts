@@ -135,3 +135,12 @@ export const DB_ENCRYPTION_KEY =
 // Google API key for Gemini (memory extraction + consolidation)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
+
+// Streaming strategy for Telegram updates.
+// 'global-throttle' (default): shared per-chat rate limiter prevents concurrent agents
+//   from exceeding Telegram's edit rate limits (~20-30 msg/min per chat).
+// 'single-agent-only': streaming is disabled when multiple agents are active on the same chat.
+// 'off': no streaming, wait for full response.
+export type StreamStrategy = 'global-throttle' | 'single-agent-only' | 'off';
+export const STREAM_STRATEGY: StreamStrategy =
+  (process.env.STREAM_STRATEGY || envConfig.STREAM_STRATEGY || 'global-throttle') as StreamStrategy;

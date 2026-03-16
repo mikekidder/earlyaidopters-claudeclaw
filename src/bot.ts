@@ -17,6 +17,7 @@ import {
   agentSystemPrompt,
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
+  STREAM_STRATEGY,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
 import { logger } from './logger.js';
@@ -25,6 +26,29 @@ import { buildMemoryContext, saveConversationTurn } from './memory.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
+
+// ── Global streaming rate limiter ─────────────────────────────────────
+// Shared per-chat timestamp so concurrent agents don't exceed Telegram's
+// edit rate limits (~20-30 msg/min per chat). Used by 'global-throttle' strategy.
+const globalStreamLastEdit = new Map<string, number>();
+const GLOBAL_STREAM_INTERVAL_MS = 2500; // Conservative: max ~24 edits/min per chat
+
+// Track active streaming agents per chat for 'single-agent-only' strategy.
+const activeStreamAgents = new Map<string, number>(); // chatId -> count
+
+function registerStreamAgent(chatId: string): void {
+  activeStreamAgents.set(chatId, (activeStreamAgents.get(chatId) ?? 0) + 1);
+}
+function unregisterStreamAgent(chatId: string): void {
+  const count = (activeStreamAgents.get(chatId) ?? 1) - 1;
+  if (count <= 0) activeStreamAgents.delete(chatId);
+  else activeStreamAgents.set(chatId, count);
+}
+function canStream(chatId: string): boolean {
+  if (STREAM_STRATEGY === 'off') return false;
+  if (STREAM_STRATEGY === 'single-agent-only') return (activeStreamAgents.get(chatId) ?? 0) <= 1;
+  return true; // global-throttle always allows, just rate-limits
+}
 
 // ── Context window tracking ──────────────────────────────────────────
 // Uses input_tokens from the last API call (= actual context window size:
@@ -388,6 +412,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   );
 
   setProcessing(chatIdStr, true);
+  const streamingEnabled = STREAM_STRATEGY !== 'off';
+  if (streamingEnabled) registerStreamAgent(chatIdStr);
 
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
@@ -416,19 +442,22 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // ── Streaming response setup ──────────────────────────────────────
     // Send a placeholder message that we'll progressively edit with
     // streamed text, so the user sees output building in real time.
+    // Respects STREAM_STRATEGY: 'global-throttle' uses a shared per-chat
+    // rate limiter, 'single-agent-only' disables when multiple agents are
+    // active, 'off' disables entirely.
     let streamMsgId: number | undefined;
-    let lastEditTime = 0;
     let lastEditLength = 0;
-    const STREAM_EDIT_INTERVAL_MS = 1500; // ~40 edits/min max, safe for single-chat bot
-    const STREAM_MIN_DELTA = 20; // Lower threshold so updates feel snappier
+    const STREAM_MIN_DELTA = 20; // Min chars before attempting an edit
 
-    const onStreamText = (accumulated: string) => {
+    const onStreamText = streamingEnabled ? (accumulated: string) => {
+      if (!canStream(chatIdStr)) return;
+
       const now = Date.now();
-      const sinceLastEdit = now - lastEditTime;
+      const globalLast = globalStreamLastEdit.get(chatIdStr) ?? 0;
       const deltaLen = accumulated.length - lastEditLength;
 
-      // Throttle: only edit if enough time has passed AND enough new text
-      if (sinceLastEdit < STREAM_EDIT_INTERVAL_MS || deltaLen < STREAM_MIN_DELTA) return;
+      // Global throttle: skip if any agent edited this chat too recently
+      if (now - globalLast < GLOBAL_STREAM_INTERVAL_MS || deltaLen < STREAM_MIN_DELTA) return;
 
       // Truncate to Telegram's 4096 limit with overflow indicator
       let displayText = accumulated;
@@ -438,20 +467,19 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       // Show a cursor to indicate more is coming
       displayText += ' ▍';
 
+      globalStreamLastEdit.set(chatIdStr, now);
+      lastEditLength = accumulated.length;
+
       if (!streamMsgId) {
         // Send the first streaming message
-        lastEditTime = now;
-        lastEditLength = accumulated.length;
         void ctx.reply(displayText).then((sent) => {
           streamMsgId = sent.message_id;
         }).catch(() => {});
       } else {
         // Edit existing message with updated text
-        lastEditTime = now;
-        lastEditLength = accumulated.length;
         void ctx.api.editMessageText(chatId, streamMsgId, displayText).catch(() => {});
       }
-    };
+    } : undefined;
 
     const result = await runAgent(
       fullMessage,
@@ -466,6 +494,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
+    if (streamingEnabled) unregisterStreamAgent(chatIdStr);
 
     // Clean up the streaming placeholder message before sending the final formatted response.
     // Delete it so the user gets a clean, properly formatted final message instead of
@@ -580,6 +609,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   } catch (err) {
     clearInterval(typingInterval);
     setActiveAbort(chatIdStr, null);
+    if (streamingEnabled) unregisterStreamAgent(chatIdStr);
     setProcessing(chatIdStr, false);
     logger.error({ err }, 'Agent error');
 
