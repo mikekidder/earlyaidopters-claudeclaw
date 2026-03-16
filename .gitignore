@@ -30,6 +30,9 @@ migrations/.applied.json
 # Editor
 .vscode/
 .idea/
+
+# Claude Code local permissions (machine-specific)
+.claude/settings.local.json
 *.swp
 .wwebjs_cache/
 
