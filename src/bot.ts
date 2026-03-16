@@ -26,27 +26,19 @@ import { buildMemoryContext, saveConversationTurn } from './memory.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
+import {
+  getStreamState,
+  recordStreamSuccess,
+  handle429,
+  registerStreamAgent,
+  unregisterStreamAgent,
+  getActiveStreamAgentCount,
+  BASELINE_STREAM_INTERVAL_MS,
+} from './stream-limiter.js';
 
-// ── Global streaming rate limiter ─────────────────────────────────────
-// Shared per-chat timestamp so concurrent agents don't exceed Telegram's
-// edit rate limits (~20-30 msg/min per chat). Used by 'global-throttle' strategy.
-const globalStreamLastEdit = new Map<string, number>();
-const GLOBAL_STREAM_INTERVAL_MS = 2500; // Conservative: max ~24 edits/min per chat
-
-// Track active streaming agents per chat for 'single-agent-only' strategy.
-const activeStreamAgents = new Map<string, number>(); // chatId -> count
-
-function registerStreamAgent(chatId: string): void {
-  activeStreamAgents.set(chatId, (activeStreamAgents.get(chatId) ?? 0) + 1);
-}
-function unregisterStreamAgent(chatId: string): void {
-  const count = (activeStreamAgents.get(chatId) ?? 1) - 1;
-  if (count <= 0) activeStreamAgents.delete(chatId);
-  else activeStreamAgents.set(chatId, count);
-}
 function canStream(chatId: string): boolean {
   if (STREAM_STRATEGY === 'off') return false;
-  if (STREAM_STRATEGY === 'single-agent-only') return (activeStreamAgents.get(chatId) ?? 0) <= 1;
+  if (STREAM_STRATEGY === 'single-agent-only') return getActiveStreamAgentCount(chatId) <= 1;
   return true; // global-throttle always allows, just rate-limits
 }
 
@@ -447,17 +439,17 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // active, 'off' disables entirely.
     let streamMsgId: number | undefined;
     let lastEditLength = 0;
-    const STREAM_MIN_DELTA = 20; // Min chars before attempting an edit
+    const STREAM_MIN_DELTA = 40; // Min chars before attempting an edit
 
     const onStreamText = streamingEnabled ? (accumulated: string) => {
       if (!canStream(chatIdStr)) return;
 
       const now = Date.now();
-      const globalLast = globalStreamLastEdit.get(chatIdStr) ?? 0;
+      const state = getStreamState(chatIdStr);
       const deltaLen = accumulated.length - lastEditLength;
 
-      // Global throttle: skip if any agent edited this chat too recently
-      if (now - globalLast < GLOBAL_STREAM_INTERVAL_MS || deltaLen < STREAM_MIN_DELTA) return;
+      // Adaptive throttle: interval starts at baseline, grows on 429, decays on success
+      if (now - state.lastEditTime < state.interval || deltaLen < STREAM_MIN_DELTA) return;
 
       // Truncate to Telegram's 4096 limit with overflow indicator
       let displayText = accumulated;
@@ -467,17 +459,20 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       // Show a cursor to indicate more is coming
       displayText += ' ▍';
 
-      globalStreamLastEdit.set(chatIdStr, now);
+      state.lastEditTime = now;
       lastEditLength = accumulated.length;
 
       if (!streamMsgId) {
         // Send the first streaming message
         void ctx.reply(displayText).then((sent) => {
           streamMsgId = sent.message_id;
-        }).catch(() => {});
+          recordStreamSuccess(chatIdStr);
+        }).catch((err) => handle429(chatIdStr, err));
       } else {
         // Edit existing message with updated text
-        void ctx.api.editMessageText(chatId, streamMsgId, displayText).catch(() => {});
+        void ctx.api.editMessageText(chatId, streamMsgId, displayText)
+          .then(() => recordStreamSuccess(chatIdStr))
+          .catch((err) => handle429(chatIdStr, err));
       }
     } : undefined;
 
@@ -496,19 +491,12 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     clearInterval(typingInterval);
     if (streamingEnabled) unregisterStreamAgent(chatIdStr);
 
-    // Clean up the streaming placeholder message before sending the final formatted response.
-    // Delete it so the user gets a clean, properly formatted final message instead of
-    // both the raw stream and the formatted version.
-    if (streamMsgId) {
-      try {
-        await ctx.api.deleteMessage(chatId, streamMsgId);
-      } catch {
-        // Best-effort — message may have already been deleted or too old
-      }
-    }
-
     // Handle abort (manual /stop or timeout)
     if (result.aborted) {
+      // Clean up stream message on abort
+      if (streamMsgId) {
+        try { await ctx.api.deleteMessage(chatId, streamMsgId); } catch { /* best-effort */ }
+      }
       setProcessing(chatIdStr, false);
       const msg = result.text === null
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
@@ -561,23 +549,45 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    // Send text response (if there's any left after stripping markers)
+    // Send text response. If a streaming message exists, edit it in-place with the
+    // final formatted text (first part) instead of delete + new message. This preserves
+    // the message position in chat and avoids losing intermediate agentic responses.
     if (responseText) {
+      const parts = splitMessage(formatForTelegram(responseText));
       if (shouldSpeakBack) {
+        // Voice: delete stream message (can't edit into audio), send audio
+        if (streamMsgId) {
+          try { await ctx.api.deleteMessage(chatId, streamMsgId); } catch { /* best-effort */ }
+        }
         try {
           const audioBuffer = await synthesizeSpeech(responseText);
           await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
         } catch (ttsErr) {
           logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-          for (const part of splitMessage(formatForTelegram(responseText))) {
+          for (const part of parts) {
             await ctx.reply(part, { parse_mode: 'HTML' });
           }
         }
+      } else if (streamMsgId && parts.length > 0) {
+        // Edit first part into stream message, send remaining as new messages
+        try {
+          await ctx.api.editMessageText(chatId, streamMsgId, parts[0], { parse_mode: 'HTML' });
+        } catch {
+          // Edit failed (deleted, too old, etc.) — fall back to new message
+          await ctx.reply(parts[0], { parse_mode: 'HTML' });
+        }
+        for (let i = 1; i < parts.length; i++) {
+          await ctx.reply(parts[i], { parse_mode: 'HTML' });
+        }
       } else {
-        for (const part of splitMessage(formatForTelegram(responseText))) {
+        // No stream message — send all parts as new messages
+        for (const part of parts) {
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
       }
+    } else if (streamMsgId) {
+      // No response text but stream message exists — clean it up
+      try { await ctx.api.deleteMessage(chatId, streamMsgId); } catch { /* best-effort */ }
     }
 
     // Log token usage to SQLite and check for context warnings

@@ -144,3 +144,11 @@ export const GOOGLE_API_KEY =
 export type StreamStrategy = 'global-throttle' | 'single-agent-only' | 'off';
 export const STREAM_STRATEGY: StreamStrategy =
   (process.env.STREAM_STRATEGY || envConfig.STREAM_STRATEGY || 'global-throttle') as StreamStrategy;
+
+// Baseline interval (ms) between streaming edits per chat.
+// Lower = more responsive but higher risk of Telegram rate limits.
+// Override via STREAM_INTERVAL_MS in .env. Default: 1500.
+export const STREAM_INTERVAL_MS = parseInt(
+  process.env.STREAM_INTERVAL_MS || envConfig.STREAM_INTERVAL_MS || '1500',
+  10,
+);
