@@ -108,6 +108,7 @@ export async function runAgent(
   onProgress?: (event: AgentProgressEvent) => void,
   model?: string,
   abortController?: AbortController,
+  onStreamText?: (accumulatedText: string) => void,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -129,6 +130,11 @@ export async function runAgent(
   let preCompactTokens: number | null = null;
   let lastCallCacheRead = 0;
   let lastCallInputTokens = 0;
+
+  // Streaming text accumulator for progressive Telegram updates.
+  // Only the final (outermost) assistant response is streamed;
+  // tool-use sub-turns emit deltas with a parent_tool_use_id which we skip.
+  let streamedText = '';
 
   // Refresh typing indicator on an interval while Claude works.
   // Telegram's "typing..." action expires after ~5s.
@@ -159,6 +165,9 @@ export async function runAgent(
 
         // Pass secrets to the subprocess without polluting our own process.env
         env: sdkEnv,
+
+        // Stream partial text so Telegram can show progressive updates
+        includePartialMessages: !!onStreamText,
 
         // Model override (e.g. 'claude-haiku-4-5', 'claude-sonnet-4-5')
         ...(model ? { model } : {}),
@@ -218,6 +227,26 @@ export async function runAgent(
           type: 'task_completed',
           description: status === 'failed' ? `Failed: ${summary}` : summary,
         });
+      }
+
+      // Stream text deltas for progressive Telegram updates.
+      // SDKPartialAssistantMessage: { type: 'stream_event', event: BetaRawMessageStreamEvent }
+      // We only stream the outermost assistant response (parent_tool_use_id === null)
+      // to avoid showing internal tool-use reasoning.
+      if (ev['type'] === 'stream_event' && onStreamText && ev['parent_tool_use_id'] === null) {
+        const streamEvent = ev['event'] as Record<string, unknown> | undefined;
+        if (streamEvent?.['type'] === 'content_block_delta') {
+          const delta = streamEvent['delta'] as Record<string, unknown> | undefined;
+          if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string') {
+            streamedText += delta['text'];
+            onStreamText(streamedText);
+          }
+        }
+        // Reset accumulated text when a new outermost assistant message starts
+        // (e.g. after a tool-use cycle returns to the final response)
+        if (streamEvent?.['type'] === 'message_start') {
+          streamedText = '';
+        }
       }
 
       if (ev['type'] === 'result') {

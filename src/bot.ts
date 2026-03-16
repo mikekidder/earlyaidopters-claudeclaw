@@ -412,6 +412,46 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       abortCtrl.abort();
     }, AGENT_TIMEOUT_MS);
 
+    // ── Streaming response setup ──────────────────────────────────────
+    // Send a placeholder message that we'll progressively edit with
+    // streamed text, so the user sees output building in real time.
+    let streamMsgId: number | undefined;
+    let lastEditTime = 0;
+    let lastEditLength = 0;
+    const STREAM_EDIT_INTERVAL_MS = 1500; // ~40 edits/min max, safe for single-chat bot
+    const STREAM_MIN_DELTA = 20; // Lower threshold so updates feel snappier
+
+    const onStreamText = (accumulated: string) => {
+      const now = Date.now();
+      const sinceLastEdit = now - lastEditTime;
+      const deltaLen = accumulated.length - lastEditLength;
+
+      // Throttle: only edit if enough time has passed AND enough new text
+      if (sinceLastEdit < STREAM_EDIT_INTERVAL_MS || deltaLen < STREAM_MIN_DELTA) return;
+
+      // Truncate to Telegram's 4096 limit with overflow indicator
+      let displayText = accumulated;
+      if (displayText.length > 4000) {
+        displayText = displayText.slice(displayText.length - 3900) + '\n\n[...streaming]';
+      }
+      // Show a cursor to indicate more is coming
+      displayText += ' ▍';
+
+      if (!streamMsgId) {
+        // Send the first streaming message
+        lastEditTime = now;
+        lastEditLength = accumulated.length;
+        void ctx.reply(displayText).then((sent) => {
+          streamMsgId = sent.message_id;
+        }).catch(() => {});
+      } else {
+        // Edit existing message with updated text
+        lastEditTime = now;
+        lastEditLength = accumulated.length;
+        void ctx.api.editMessageText(chatId, streamMsgId, displayText).catch(() => {});
+      }
+    };
+
     const result = await runAgent(
       fullMessage,
       sessionId,
@@ -419,11 +459,23 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
+      onStreamText,
     );
 
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
+
+    // Clean up the streaming placeholder message before sending the final formatted response.
+    // Delete it so the user gets a clean, properly formatted final message instead of
+    // both the raw stream and the formatted version.
+    if (streamMsgId) {
+      try {
+        await ctx.api.deleteMessage(chatId, streamMsgId);
+      } catch {
+        // Best-effort — message may have already been deleted or too old
+      }
+    }
 
     // Handle abort (manual /stop or timeout)
     if (result.aborted) {
